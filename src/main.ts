@@ -53,6 +53,8 @@ let pendingPdfSearch = "";
 let pendingPdfAmountFilter = "all";
 let pendingPdfPage = 1;
 const pendingPdfPageSize = 12;
+let editingRuleId: number | null = null;
+let editingCategoryName: string | null = null;
 
 const formatMoney = (value: number): string => new Intl.NumberFormat("fr-CA", {style: "currency", currency: "CAD"}).format(value);
 
@@ -174,7 +176,8 @@ const renderLayout = (): void => {
             </select>
             <input id="rule-priority" type="number" value="10" min="1" max="999" required />
             <div class="split-actions">
-              <button class="btn" type="submit">Ajouter regle</button>
+							<button id="rule-submit-btn" class="btn" type="submit">Ajouter regle</button>
+							<button id="rule-cancel-edit-btn" class="btn alt" type="button" hidden>Annuler modif</button>
               <button id="apply-rules-btn" class="btn alt" type="button">Re-categoriser mois</button>
             </div>
           </form>
@@ -185,7 +188,10 @@ const renderLayout = (): void => {
 				<h2>Categories personnalisees</h2>
 				<form id="category-form" class="stack-form small-gap">
 					<input id="category-name" type="text" placeholder="Nouvelle categorie" required />
-					<button class="btn" type="submit">Ajouter categorie</button>
+					<div class="split-actions">
+						<button id="category-submit-btn" class="btn" type="submit">Ajouter categorie</button>
+						<button id="category-cancel-edit-btn" class="btn alt" type="button" hidden>Annuler modif</button>
+					</div>
 				</form>
 				<ul id="custom-categories-list" class="compact-list"></ul>
 			</article>
@@ -291,12 +297,34 @@ const renderRules = (): void => {
 	const list = document.querySelector<HTMLUListElement>("#rules-list");
 	if (!list) return;
 	const sorted = [...rules].sort((a, b) => a.priority - b.priority);
-	list.innerHTML = sorted.map((rule) => `<li><strong>${rule.pattern}</strong> -> ${rule.category} (${rule.matchType}, p${rule.priority})</li>`).join("");
+	list.innerHTML = sorted
+		.map(
+			(rule) => `<li>
+				<span><strong>${rule.pattern}</strong> -> ${rule.category} (${rule.matchType}, p${rule.priority})</span>
+				<span class="split-actions">
+					<button class="btn alt compact" type="button" data-action="edit-rule" data-rule-id="${rule.id ?? ""}">Modifier</button>
+					<button class="btn danger compact" type="button" data-action="delete-rule" data-rule-id="${rule.id ?? ""}">Supprimer</button>
+				</span>
+			</li>`,
+		)
+		.join("");
 
 	const customList = document.querySelector<HTMLUListElement>("#custom-categories-list");
 	if (!customList) return;
 	const categories = sortCategories(customCategories.map((category) => category.name));
-	customList.innerHTML = categories.length > 0 ? categories.map((category) => `<li>${category}</li>`).join("") : '<li class="muted">Aucune categorie personnalisee.</li>';
+	customList.innerHTML = categories.length > 0
+		? categories
+				.map(
+					(category) => `<li>
+						<span>${category}</span>
+						<span class="split-actions">
+							<button class="btn alt compact" type="button" data-action="edit-category" data-category-name="${category}">Modifier</button>
+							<button class="btn danger compact" type="button" data-action="delete-category" data-category-name="${category}">Supprimer</button>
+						</span>
+					</li>`,
+				)
+				.join("")
+		: '<li class="muted">Aucune categorie personnalisee.</li>';
 };
 
 const syncCategorySelect = (select: HTMLSelectElement, optionsHtml: string, fallback: string): void => {
@@ -563,21 +591,82 @@ const addRule = async (): Promise<void> => {
 	const matchInput = document.querySelector<HTMLSelectElement>("#rule-match");
 	const categoryInput = document.querySelector<HTMLSelectElement>("#rule-category");
 	const priorityInput = document.querySelector<HTMLInputElement>("#rule-priority");
+	const submitBtn = document.querySelector<HTMLButtonElement>("#rule-submit-btn");
+	const cancelBtn = document.querySelector<HTMLButtonElement>("#rule-cancel-edit-btn");
 	if (!patternInput || !matchInput || !categoryInput || !priorityInput) return;
 
 	const pattern = patternInput.value.trim();
 	const priority = Number.parseInt(priorityInput.value, 10);
 	if (!pattern || Number.isNaN(priority)) return;
-
-	await db.rules.add({
+	const nextRule: Omit<CategoryRule, "id"> = {
 		pattern,
 		matchType: matchInput.value === "startsWith" ? "startsWith" : "contains",
 		category: categoryInput.value,
 		priority,
-	});
+	};
+
+	if (editingRuleId !== null) {
+		await db.rules.update(editingRuleId, nextRule);
+	} else {
+		await db.rules.add(nextRule);
+	}
 
 	rules = await db.rules.toArray();
+	editingRuleId = null;
 	patternInput.value = "";
+	matchInput.value = "contains";
+	priorityInput.value = "10";
+	if (submitBtn) {
+		submitBtn.textContent = "Ajouter regle";
+	}
+	if (cancelBtn) {
+		cancelBtn.hidden = true;
+	}
+	refresh();
+};
+
+const startRuleEdition = (ruleId: number): void => {
+	const rule = rules.find((candidate) => candidate.id === ruleId);
+	if (!rule) return;
+	const patternInput = document.querySelector<HTMLInputElement>("#rule-pattern");
+	const matchInput = document.querySelector<HTMLSelectElement>("#rule-match");
+	const categoryInput = document.querySelector<HTMLSelectElement>("#rule-category");
+	const priorityInput = document.querySelector<HTMLInputElement>("#rule-priority");
+	const submitBtn = document.querySelector<HTMLButtonElement>("#rule-submit-btn");
+	const cancelBtn = document.querySelector<HTMLButtonElement>("#rule-cancel-edit-btn");
+	if (!patternInput || !matchInput || !categoryInput || !priorityInput || !submitBtn || !cancelBtn) return;
+
+	editingRuleId = ruleId;
+	patternInput.value = rule.pattern;
+	matchInput.value = rule.matchType;
+	categoryInput.value = rule.category;
+	priorityInput.value = String(rule.priority);
+	submitBtn.textContent = "Enregistrer modif";
+	cancelBtn.hidden = false;
+	patternInput.focus();
+};
+
+const resetRuleEdition = (): void => {
+	const patternInput = document.querySelector<HTMLInputElement>("#rule-pattern");
+	const matchInput = document.querySelector<HTMLSelectElement>("#rule-match");
+	const priorityInput = document.querySelector<HTMLInputElement>("#rule-priority");
+	const submitBtn = document.querySelector<HTMLButtonElement>("#rule-submit-btn");
+	const cancelBtn = document.querySelector<HTMLButtonElement>("#rule-cancel-edit-btn");
+
+	editingRuleId = null;
+	if (patternInput) patternInput.value = "";
+	if (matchInput) matchInput.value = "contains";
+	if (priorityInput) priorityInput.value = "10";
+	if (submitBtn) submitBtn.textContent = "Ajouter regle";
+	if (cancelBtn) cancelBtn.hidden = true;
+};
+
+const deleteRule = async (ruleId: number): Promise<void> => {
+	await db.rules.delete(ruleId);
+	rules = await db.rules.toArray();
+	if (editingRuleId === ruleId) {
+		resetRuleEdition();
+	}
 	refresh();
 };
 
@@ -789,6 +878,8 @@ const renderPdfPreviewModal = (): void => {
 
 const addCustomCategory = async (): Promise<void> => {
 	const categoryInput = document.querySelector<HTMLInputElement>("#category-name");
+	const submitBtn = document.querySelector<HTMLButtonElement>("#category-submit-btn");
+	const cancelBtn = document.querySelector<HTMLButtonElement>("#category-cancel-edit-btn");
 	const feedback = document.querySelector<HTMLParagraphElement>("#import-feedback");
 	if (!categoryInput) return;
 
@@ -796,7 +887,10 @@ const addCustomCategory = async (): Promise<void> => {
 	if (!rawName) return;
 
 	const normalizedName = rawName.replace(/\s+/g, " ");
-	const existing = allCategories().some((category) => category.localeCompare(normalizedName, "fr-CA", {sensitivity: "base"}) === 0);
+	const wasEditing = editingCategoryName !== null;
+	const existing = allCategories().some(
+		(category) => category.localeCompare(normalizedName, "fr-CA", {sensitivity: "base"}) === 0 && category.localeCompare(editingCategoryName ?? "", "fr-CA", {sensitivity: "base"}) !== 0,
+	);
 	if (existing) {
 		if (feedback) {
 			feedback.textContent = `La categorie \"${normalizedName}\" existe deja.`;
@@ -804,19 +898,137 @@ const addCustomCategory = async (): Promise<void> => {
 		return;
 	}
 
-	await db.categories.add({
-		name: normalizedName,
-		createdAt: new Date().toISOString(),
-	});
+	if (editingCategoryName) {
+		const originalName = editingCategoryName;
+		const originalCategory = customCategories.find((category) => category.name === originalName);
+		if (!originalCategory) return;
+
+		await db.transaction("rw", db.categories, db.transactions, db.rules, async () => {
+			if (originalName !== normalizedName) {
+				await db.categories.delete(originalName);
+				await db.categories.add({
+					name: normalizedName,
+					createdAt: originalCategory.createdAt,
+				});
+
+				const relatedTransactions = await db.transactions.where("category").equals(originalName).toArray();
+				for (const transaction of relatedTransactions) {
+					if (transaction.id) {
+						await db.transactions.update(transaction.id, {category: normalizedName});
+					}
+				}
+
+				const relatedRules = await db.rules.where("category").equals(originalName).toArray();
+				for (const rule of relatedRules) {
+					if (rule.id) {
+						await db.rules.update(rule.id, {category: normalizedName});
+					}
+				}
+			}
+		});
+
+		transactions = transactions.map((transaction) => (transaction.category === originalName ? {...transaction, category: normalizedName} : transaction));
+		rules = rules.map((rule) => (rule.category === originalName ? {...rule, category: normalizedName} : rule));
+		pendingPdfRows = pendingPdfRows.map((row) => (row.tx.category === originalName ? {...row, tx: {...row.tx, category: normalizedName}} : row));
+		if (selectedCategoryDrilldown === originalName) {
+			selectedCategoryDrilldown = normalizedName;
+		}
+	} else {
+		await db.categories.add({
+			name: normalizedName,
+			createdAt: new Date().toISOString(),
+		});
+	}
 	customCategories = await db.categories.toArray();
+	editingCategoryName = null;
 	categoryInput.value = "";
+	if (submitBtn) {
+		submitBtn.textContent = "Ajouter categorie";
+	}
+	if (cancelBtn) {
+		cancelBtn.hidden = true;
+	}
 	syncCategoryControls();
-	renderRules();
-	renderTransactions();
+	refresh();
 	renderPdfPreviewModal();
 
 	if (feedback) {
-		feedback.textContent = `Categorie ajoutee: ${normalizedName}`;
+		feedback.textContent = wasEditing ? `Categorie modifiee: ${normalizedName}` : `Categorie ajoutee: ${normalizedName}`;
+	}
+};
+
+const startCategoryEdition = (categoryName: string): void => {
+	const categoryInput = document.querySelector<HTMLInputElement>("#category-name");
+	const submitBtn = document.querySelector<HTMLButtonElement>("#category-submit-btn");
+	const cancelBtn = document.querySelector<HTMLButtonElement>("#category-cancel-edit-btn");
+	if (!categoryInput || !submitBtn || !cancelBtn) return;
+
+	editingCategoryName = categoryName;
+	categoryInput.value = categoryName;
+	submitBtn.textContent = "Enregistrer modif";
+	cancelBtn.hidden = false;
+	categoryInput.focus();
+};
+
+const resetCategoryEdition = (): void => {
+	const categoryInput = document.querySelector<HTMLInputElement>("#category-name");
+	const submitBtn = document.querySelector<HTMLButtonElement>("#category-submit-btn");
+	const cancelBtn = document.querySelector<HTMLButtonElement>("#category-cancel-edit-btn");
+
+	editingCategoryName = null;
+	if (categoryInput) {
+		categoryInput.value = "";
+	}
+	if (submitBtn) {
+		submitBtn.textContent = "Ajouter categorie";
+	}
+	if (cancelBtn) {
+		cancelBtn.hidden = true;
+	}
+};
+
+const deleteCustomCategory = async (categoryName: string): Promise<void> => {
+	const feedback = document.querySelector<HTMLParagraphElement>("#import-feedback");
+	const relatedTransactions = transactions.filter((transaction) => transaction.category === categoryName);
+	const relatedRules = rules.filter((rule) => rule.category === categoryName);
+	const needsReassign = relatedTransactions.length > 0 || relatedRules.length > 0;
+	const message = needsReassign
+		? `Supprimer la categorie \"${categoryName}\" ? ${relatedTransactions.length} transaction(s) et ${relatedRules.length} regle(s) seront reaffectees a \"Non classe\".`
+		: `Supprimer la categorie \"${categoryName}\" ?`;
+	if (!window.confirm(message)) return;
+
+	await db.transaction("rw", db.categories, db.transactions, db.rules, async () => {
+		await db.categories.delete(categoryName);
+
+		for (const transaction of relatedTransactions) {
+			if (transaction.id) {
+				await db.transactions.update(transaction.id, {category: "Non classe"});
+			}
+		}
+
+		for (const rule of relatedRules) {
+			if (rule.id) {
+				await db.rules.update(rule.id, {category: "Non classe"});
+			}
+		}
+	});
+
+	transactions = transactions.map((transaction) => (transaction.category === categoryName ? {...transaction, category: "Non classe"} : transaction));
+	rules = rules.map((rule) => (rule.category === categoryName ? {...rule, category: "Non classe"} : rule));
+	pendingPdfRows = pendingPdfRows.map((row) => (row.tx.category === categoryName ? {...row, tx: {...row.tx, category: "Non classe"}} : row));
+	customCategories = await db.categories.toArray();
+	if (selectedCategoryDrilldown === categoryName) {
+		selectedCategoryDrilldown = null;
+	}
+	if (editingCategoryName === categoryName) {
+		resetCategoryEdition();
+	}
+	syncCategoryControls();
+	refresh();
+	renderPdfPreviewModal();
+
+	if (feedback) {
+		feedback.textContent = `Categorie supprimee: ${categoryName}`;
 	}
 };
 
@@ -998,7 +1210,11 @@ const bindEvents = (): void => {
 	const pdfTextForm = document.querySelector<HTMLFormElement>("#pdf-text-form");
 	const pdfTextInput = document.querySelector<HTMLTextAreaElement>("#pdf-text-input");
 	const ruleForm = document.querySelector<HTMLFormElement>("#rule-form");
+	const ruleList = document.querySelector<HTMLUListElement>("#rules-list");
+	const ruleCancelEditBtn = document.querySelector<HTMLButtonElement>("#rule-cancel-edit-btn");
 	const categoryForm = document.querySelector<HTMLFormElement>("#category-form");
+	const customCategoriesList = document.querySelector<HTMLUListElement>("#custom-categories-list");
+	const categoryCancelEditBtn = document.querySelector<HTMLButtonElement>("#category-cancel-edit-btn");
 	const applyRulesBtn = document.querySelector<HTMLButtonElement>("#apply-rules-btn");
 	const goalForm = document.querySelector<HTMLFormElement>("#goal-form");
 	const goalInput = document.querySelector<HTMLInputElement>("#goal-value");
@@ -1183,9 +1399,54 @@ const bindEvents = (): void => {
 		await addRule();
 	});
 
+	ruleCancelEditBtn?.addEventListener("click", () => {
+		resetRuleEdition();
+	});
+
+	ruleList?.addEventListener("click", async (event) => {
+		const target = event.target as HTMLElement;
+		const actionButton = target.closest<HTMLButtonElement>("button[data-action]");
+		if (!actionButton) return;
+
+		const rawId = actionButton.dataset.ruleId;
+		const ruleId = rawId ? Number.parseInt(rawId, 10) : Number.NaN;
+		if (Number.isNaN(ruleId)) return;
+
+		if (actionButton.dataset.action === "edit-rule") {
+			startRuleEdition(ruleId);
+			return;
+		}
+
+		if (actionButton.dataset.action === "delete-rule") {
+			await deleteRule(ruleId);
+		}
+	});
+
 	categoryForm?.addEventListener("submit", async (event) => {
 		event.preventDefault();
 		await addCustomCategory();
+	});
+
+	categoryCancelEditBtn?.addEventListener("click", () => {
+		resetCategoryEdition();
+	});
+
+	customCategoriesList?.addEventListener("click", async (event) => {
+		const target = event.target as HTMLElement;
+		const actionButton = target.closest<HTMLButtonElement>("button[data-action]");
+		if (!actionButton) return;
+
+		const categoryName = actionButton.dataset.categoryName;
+		if (!categoryName) return;
+
+		if (actionButton.dataset.action === "edit-category") {
+			startCategoryEdition(categoryName);
+			return;
+		}
+
+		if (actionButton.dataset.action === "delete-category") {
+			await deleteCustomCategory(categoryName);
+		}
 	});
 
 	applyRulesBtn?.addEventListener("click", async () => {

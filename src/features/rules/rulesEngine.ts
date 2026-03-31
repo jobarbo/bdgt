@@ -10,6 +10,28 @@ const isMatch = (description: string, pattern: string, matchType: MatchType): bo
 	return description.includes(pattern);
 };
 
+const compareRules = (left: CategoryRule, right: CategoryRule): number => {
+	if (left.priority !== right.priority) {
+		return left.priority - right.priority;
+	}
+
+	const leftPatternLength = normalize(left.pattern).length;
+	const rightPatternLength = normalize(right.pattern).length;
+	if (leftPatternLength !== rightPatternLength) {
+		return rightPatternLength - leftPatternLength;
+	}
+
+	if (left.matchType !== right.matchType) {
+		return left.matchType === "startsWith" ? -1 : 1;
+	}
+
+	if (left.id !== undefined && right.id !== undefined && left.id !== right.id) {
+		return left.id - right.id;
+	}
+
+	return normalize(left.pattern).localeCompare(normalize(right.pattern), "fr-CA", {sensitivity: "base"});
+};
+
 export const inferCategoryFromDescription = (description: string, amount: number): string => {
 	const d = normalize(description);
 
@@ -54,7 +76,7 @@ export const inferCategoryFromDescription = (description: string, amount: number
 
 export const applyRulesToTransaction = (transaction: Transaction, rules: CategoryRule[]): Transaction => {
 	const description = normalize(transaction.description);
-	const sortedRules = [...rules].sort((a, b) => a.priority - b.priority);
+	const sortedRules = [...rules].sort(compareRules);
 
 	for (const rule of sortedRules) {
 		const rulePattern = normalize(rule.pattern);
