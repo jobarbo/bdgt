@@ -11,9 +11,14 @@
 # Whitelist directories
 !public/
 !scripts/
+!server/
 !src/
 
 # Allow everything inside whitelisted directories
 !public/**
 !scripts/**
+!server/**
 !src/**
+
+# Keep local data files out of git by default
+data/

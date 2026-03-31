@@ -22,6 +22,11 @@ export interface CategoryRule {
 	priority: number;
 }
 
+export interface CustomCategory {
+	name: string;
+	createdAt: string;
+}
+
 export interface MonthlyGoal {
 	id?: number;
 	month: string;
@@ -61,3 +66,6 @@ export const DEFAULT_CATEGORIES = [
 ] as const;
 
 export const FIXED_CATEGORIES = new Set<string>(["Logement", "Abonnements", "Frais bancaires", "Impots"]);
+
+export const sortCategories = (categories: string[]): string[] =>
+	[...new Set(categories.map((category) => category.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b, "fr-CA", {sensitivity: "base"}));

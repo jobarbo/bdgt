@@ -1,11 +1,11 @@
 import Chart from "chart.js/auto";
 import "./style.css";
-import {DEFAULT_CATEGORIES, type CategoryRule, type MonthlyGoal, type Transaction} from "./domain/types";
+import {DEFAULT_CATEGORIES, sortCategories, type CategoryRule, type CustomCategory, type MonthlyGoal, type Transaction} from "./domain/types";
 import {summarizeMonth, expensesByCategory, expensesByDescriptionForCategory} from "./features/dashboard/dashboard";
 import {exportTransactionsCsv} from "./features/export/exportCsv";
 import {parseWealthsimpleCsv, createFingerprint} from "./features/import/csvWealthsimple";
 import {parseWealthsimplePdfText} from "./features/import/pdfTextImport";
-import {applyRulesToTransaction} from "./features/rules/rulesEngine";
+import {applyRulesToTransaction, categorizeTransaction} from "./features/rules/rulesEngine";
 import {db} from "./storage/db";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -15,16 +15,53 @@ if (!app) {
 }
 
 const nowMonth = new Date().toISOString().slice(0, 7);
+const backendBaseUrl = "http://localhost:8787";
+
+interface PdfPreviewResponse {
+	sourceLabel: string;
+	extractedCsvPath: string;
+	transactions: Array<{
+		date: string;
+		description: string;
+		amount: number;
+		source?: string;
+		category?: string;
+	}>;
+	errors: string[];
+}
+
+type ImportMode = "all" | "insert-only" | "update-only";
+
+interface PendingPdfRow {
+	previewId: string;
+	selected: boolean;
+	tx: Transaction;
+}
 
 let transactions: Transaction[] = [];
 let rules: CategoryRule[] = [];
 let goals: MonthlyGoal[] = [];
+let customCategories: CustomCategory[] = [];
 let activeMonth = nowMonth;
 let categoryChart: Chart<"bar"> | null = null;
 let categoryDetailChart: Chart<"bar"> | null = null;
 let selectedCategoryDrilldown: string | null = null;
+let pendingPdfRows: PendingPdfRow[] = [];
+let pendingPdfErrors: string[] = [];
+let pendingPdfSourceLabel = "";
+let pendingPdfSearch = "";
+let pendingPdfAmountFilter = "all";
+let pendingPdfPage = 1;
+const pendingPdfPageSize = 12;
 
 const formatMoney = (value: number): string => new Intl.NumberFormat("fr-CA", {style: "currency", currency: "CAD"}).format(value);
+
+const allCategories = (): string[] => sortCategories([...DEFAULT_CATEGORIES, ...customCategories.map((category) => category.name)]);
+
+const categoryOptionsHtml = (selected?: string): string =>
+	allCategories()
+		.map((category) => `<option value="${category}" ${selected === category ? "selected" : ""}>${category}</option>`)
+		.join("");
 
 const toInputDate = (value: string): string => {
 	if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
@@ -62,7 +99,7 @@ const renderLayout = (): void => {
           <label for="category-filter">Categorie</label>
           <select id="category-filter">
             <option value="all">Toutes</option>
-            ${DEFAULT_CATEGORIES.map((c) => `<option value="${c}">${c}</option>`).join("")}
+						${categoryOptionsHtml()}
           </select>
         </div>
       </section>
@@ -99,7 +136,7 @@ const renderLayout = (): void => {
             <input id="manual-description" type="text" placeholder="Description" required />
             <input id="manual-amount" type="number" step="0.01" placeholder="Montant (depense negative)" required />
             <select id="manual-category">
-              ${DEFAULT_CATEGORIES.map((c) => `<option value="${c}">${c}</option>`).join("")}
+							${categoryOptionsHtml()}
             </select>
             <button class="btn" type="submit">Ajouter transaction</button>
           </form>
@@ -107,11 +144,19 @@ const renderLayout = (): void => {
 
         <article class="panel">
           <h2>Import PDF Wealthsimple</h2>
-          <form id="pdf-text-form" class="stack-form">
-            <textarea id="pdf-text-input" rows="7" placeholder="Colle ici le texte copie depuis ton PDF Wealthsimple"></textarea>
-            <button class="btn alt" type="submit">Importer texte PDF</button>
-          </form>
-          <p class="muted">Astuce: ouvre le PDF, selectionne le tableau des transactions, copie-colle ici.</p>
+					<div id="pdf-drop-zone" class="pdf-drop-zone">
+						<p>Glisse un PDF ici pour lancer une previsualisation.</p>
+						<button id="pdf-import-btn" class="btn alt" type="button">Choisir un PDF</button>
+						<input id="pdf-input" class="visually-hidden" type="file" accept="application/pdf,.pdf" />
+					</div>
+					<p class="muted">Le backend local extrait le PDF, puis un modal te permet de valider chaque transaction avant import.</p>
+					<details class="pdf-fallback">
+						<summary>Mode texte de secours</summary>
+						<form id="pdf-text-form" class="stack-form">
+							<textarea id="pdf-text-input" rows="7" placeholder="Colle ici le texte copie depuis ton PDF Wealthsimple"></textarea>
+							<button class="btn alt" type="submit">Importer texte PDF</button>
+						</form>
+					</details>
         </article>
       </section>
 
@@ -125,7 +170,7 @@ const renderLayout = (): void => {
               <option value="startsWith">Commence par</option>
             </select>
             <select id="rule-category">
-              ${DEFAULT_CATEGORIES.map((c) => `<option value="${c}">${c}</option>`).join("")}
+							${categoryOptionsHtml()}
             </select>
             <input id="rule-priority" type="number" value="10" min="1" max="999" required />
             <div class="split-actions">
@@ -135,6 +180,15 @@ const renderLayout = (): void => {
           </form>
           <ul id="rules-list" class="compact-list"></ul>
         </article>
+
+				<article class="panel">
+				<h2>Categories personnalisees</h2>
+				<form id="category-form" class="stack-form small-gap">
+					<input id="category-name" type="text" placeholder="Nouvelle categorie" required />
+					<button class="btn" type="submit">Ajouter categorie</button>
+				</form>
+				<ul id="custom-categories-list" class="compact-list"></ul>
+			</article>
       </section>
 
       <section class="panel">
@@ -159,6 +213,59 @@ const renderLayout = (): void => {
           </table>
         </div>
       </section>
+
+			<div id="pdf-preview-modal" class="modal-overlay" hidden>
+				<div class="modal-card">
+					<div class="section-head">
+						<div>
+							<h2>Valider import PDF</h2>
+							<p id="pdf-preview-source" class="muted"></p>
+						</div>
+						<button id="close-pdf-preview" class="btn alt compact" type="button">Fermer</button>
+					</div>
+					<p id="pdf-preview-errors" class="muted"></p>
+					<div class="modal-toolbar">
+						<input id="pdf-preview-search" type="text" placeholder="Rechercher dans le preview..." />
+						<select id="pdf-preview-amount-filter">
+							<option value="all">Tous les montants</option>
+							<option value="negative">Montants negatifs</option>
+							<option value="positive">Montants positifs</option>
+						</select>
+						<button id="auto-categorize-pdf-preview" class="btn alt compact" type="button">Auto-categoriser</button>
+						<label class="row-check">
+							<input id="pdf-preview-select-page" type="checkbox" />
+							<span>Selectionner la page visible</span>
+						</label>
+						<p id="pdf-preview-count" class="muted"></p>
+					</div>
+					<div class="table-wrap modal-table-wrap">
+						<table>
+							<thead>
+								<tr>
+									<th></th>
+									<th>Date</th>
+									<th>Description</th>
+									<th>Montant</th>
+									<th>Categorie</th>
+									<th>Action</th>
+								</tr>
+							</thead>
+							<tbody id="pdf-preview-body"></tbody>
+						</table>
+					</div>
+					<div class="modal-pagination">
+						<button id="pdf-preview-prev" class="btn alt compact" type="button">Precedent</button>
+						<p id="pdf-preview-page" class="muted"></p>
+						<button id="pdf-preview-next" class="btn alt compact" type="button">Suivant</button>
+					</div>
+					<div class="split-actions modal-actions">
+						<button id="cancel-pdf-import" class="btn alt" type="button">Annuler</button>
+						<button id="confirm-pdf-import-all" class="btn" type="button">Import complet</button>
+						<button id="confirm-pdf-insert-only" class="btn" type="button">Importer nouveaux seulement</button>
+						<button id="confirm-pdf-update-only" class="btn alt" type="button">Mettre a jour doublons seulement</button>
+					</div>
+				</div>
+			</div>
     </main>
   `;
 };
@@ -185,6 +292,36 @@ const renderRules = (): void => {
 	if (!list) return;
 	const sorted = [...rules].sort((a, b) => a.priority - b.priority);
 	list.innerHTML = sorted.map((rule) => `<li><strong>${rule.pattern}</strong> -> ${rule.category} (${rule.matchType}, p${rule.priority})</li>`).join("");
+
+	const customList = document.querySelector<HTMLUListElement>("#custom-categories-list");
+	if (!customList) return;
+	const categories = sortCategories(customCategories.map((category) => category.name));
+	customList.innerHTML = categories.length > 0 ? categories.map((category) => `<li>${category}</li>`).join("") : '<li class="muted">Aucune categorie personnalisee.</li>';
+};
+
+const syncCategorySelect = (select: HTMLSelectElement, optionsHtml: string, fallback: string): void => {
+	const previousValue = select.value;
+	select.innerHTML = optionsHtml;
+	const allowedValues = Array.from(select.options).map((option) => option.value);
+	select.value = allowedValues.includes(previousValue) ? previousValue : fallback;
+};
+
+const syncCategoryControls = (): void => {
+	const categoryOptions = categoryOptionsHtml();
+	const filterOptions = `<option value="all">Toutes</option>${categoryOptions}`;
+	const categoryFilter = document.querySelector<HTMLSelectElement>("#category-filter");
+	const manualCategory = document.querySelector<HTMLSelectElement>("#manual-category");
+	const ruleCategory = document.querySelector<HTMLSelectElement>("#rule-category");
+
+	if (categoryFilter) {
+		syncCategorySelect(categoryFilter, filterOptions, "all");
+	}
+	if (manualCategory) {
+		syncCategorySelect(manualCategory, categoryOptions, allCategories()[0] ?? "Non classe");
+	}
+	if (ruleCategory) {
+		syncCategorySelect(ruleCategory, categoryOptions, allCategories()[0] ?? "Non classe");
+	}
 };
 
 const renderTransactions = (): void => {
@@ -192,7 +329,7 @@ const renderTransactions = (): void => {
 	if (!body) return;
 
 	const rows = filteredTransactions();
-	const categoryOptions = DEFAULT_CATEGORIES.map((category) => `<option value="${category}">${category}</option>`).join("");
+	const categoryOptions = categoryOptionsHtml();
 	body.innerHTML = rows
 		.slice(0, 300)
 		.map(
@@ -456,7 +593,7 @@ const recategorizeMonth = async (): Promise<void> => {
 	refresh();
 };
 
-const persistImportedTransactions = async (imported: Transaction[], parseErrors: string[], originLabel: string): Promise<void> => {
+const persistImportedTransactions = async (imported: Transaction[], parseErrors: string[], originLabel: string, mode: ImportMode = "all"): Promise<void> => {
 	const feedback = document.querySelector<HTMLParagraphElement>("#import-feedback");
 	const existingTransactions = await db.transactions.toArray();
 	const existingSet = new Set(existingTransactions.map((tx) => tx.fingerprint));
@@ -464,18 +601,27 @@ const persistImportedTransactions = async (imported: Transaction[], parseErrors:
 	let inserted = 0;
 	let duplicates = 0;
 	let updated = 0;
+	let skippedForMode = 0;
 	let insertedInActiveMonth = 0;
 
 	for (const tx of imported) {
-		const categorized = applyRulesToTransaction(tx, rules);
+		const categorized = categorizeTransaction(tx, rules, {preserveExistingCategory: true});
 		if (existingSet.has(categorized.fingerprint)) {
 			duplicates += 1;
+			if (mode === "insert-only") {
+				skippedForMode += 1;
+				continue;
+			}
 			const existing = existingByFingerprint.get(categorized.fingerprint);
 			if (existing?.id && existing.category !== categorized.category) {
 				await db.transactions.update(existing.id, {category: categorized.category});
 				existing.category = categorized.category;
 				updated += 1;
 			}
+			continue;
+		}
+		if (mode === "update-only") {
+			skippedForMode += 1;
 			continue;
 		}
 		await db.transactions.add(categorized);
@@ -492,12 +638,13 @@ const persistImportedTransactions = async (imported: Transaction[], parseErrors:
 
 	if (feedback) {
 		const details = parseErrors.slice(0, 3).join(" | ");
+		const modeLabel = mode === "insert-only" ? "mode nouveaux seulement" : mode === "update-only" ? "mode mises a jour doublons" : "mode complet";
 		if (imported.length === 0) {
 			feedback.textContent = `Aucune transaction lisible dans ${originLabel}.${details ? ` Details: ${details}` : ""}`;
 			return;
 		}
 		const monthHint = inserted > 0 && insertedInActiveMonth === 0 ? " Les nouvelles transactions ne sont pas dans le mois selectionne." : "";
-		feedback.textContent = `Import termine (${originLabel}): ${inserted} ajoutees, ${updated} mises a jour, ${duplicates} doublons, ${parseErrors.length} erreurs.${monthHint}${details ? ` Exemples: ${details}` : ""}`;
+		feedback.textContent = `Import termine (${originLabel}, ${modeLabel}): ${inserted} ajoutees, ${updated} mises a jour, ${duplicates} doublons, ${skippedForMode} ignorees par mode, ${parseErrors.length} erreurs.${monthHint}${details ? ` Exemples: ${details}` : ""}`;
 	}
 };
 
@@ -514,6 +661,248 @@ const importCsv = async (file: File): Promise<void> => {
 		if (feedback) {
 			const message = error instanceof Error ? error.message : "Erreur inconnue";
 			feedback.textContent = `Echec import CSV: ${message}`;
+		}
+	}
+};
+
+const pickPdfFile = (fileList: FileList | null): File | null => {
+	if (!fileList || fileList.length === 0) return null;
+	for (const file of Array.from(fileList)) {
+		const name = file.name.toLowerCase();
+		const type = file.type.toLowerCase();
+		if (name.endsWith(".pdf") || type.includes("pdf")) {
+			return file;
+		}
+	}
+	return null;
+};
+
+const filteredPendingPdfRows = (): PendingPdfRow[] => {
+	const query = pendingPdfSearch.trim().toLowerCase();
+	return pendingPdfRows.filter((row) => {
+		const matchesAmount =
+			pendingPdfAmountFilter === "all" ||
+			(pendingPdfAmountFilter === "negative" && row.tx.amount < 0) ||
+			(pendingPdfAmountFilter === "positive" && row.tx.amount > 0);
+		if (!matchesAmount) return false;
+
+		if (!query) return true;
+		const amountText = String(row.tx.amount);
+		return (
+			row.tx.date.toLowerCase().includes(query) ||
+			row.tx.description.toLowerCase().includes(query) ||
+			row.tx.category.toLowerCase().includes(query) ||
+			amountText.includes(query)
+		);
+	});
+};
+
+const currentPendingPageRows = (): PendingPdfRow[] => {
+	const filtered = filteredPendingPdfRows();
+	const maxPage = Math.max(1, Math.ceil(filtered.length / pendingPdfPageSize));
+	if (pendingPdfPage > maxPage) {
+		pendingPdfPage = maxPage;
+	}
+	const start = (pendingPdfPage - 1) * pendingPdfPageSize;
+	return filtered.slice(start, start + pendingPdfPageSize);
+};
+
+const autoCategorizePendingPdfRows = (scope: "all" | "selected", announce = true): void => {
+	const feedback = document.querySelector<HTMLParagraphElement>("#import-feedback");
+	let updated = 0;
+
+	pendingPdfRows = pendingPdfRows.map((row) => {
+		if (scope === "selected" && !row.selected) {
+			return row;
+		}
+
+		const nextTx = categorizeTransaction(row.tx, rules);
+		if (nextTx.category !== row.tx.category) {
+			updated += 1;
+		}
+
+		return {
+			...row,
+			tx: nextTx,
+		};
+	});
+
+	renderPdfPreviewModal();
+
+	if (announce && feedback) {
+		const scopeLabel = scope === "selected" ? "selection" : "preview";
+		feedback.textContent = updated > 0 ? `${updated} categories mises a jour selon tes regles pour la ${scopeLabel}.` : `Aucune categorie a ajuster selon tes regles pour la ${scopeLabel}.`;
+	}
+};
+
+const renderPdfPreviewModal = (): void => {
+	const modal = document.querySelector<HTMLDivElement>("#pdf-preview-modal");
+	const source = document.querySelector<HTMLParagraphElement>("#pdf-preview-source");
+	const errors = document.querySelector<HTMLParagraphElement>("#pdf-preview-errors");
+	const body = document.querySelector<HTMLTableSectionElement>("#pdf-preview-body");
+	const autoCategorizeBtn = document.querySelector<HTMLButtonElement>("#auto-categorize-pdf-preview");
+	const importAllBtn = document.querySelector<HTMLButtonElement>("#confirm-pdf-import-all");
+	const insertBtn = document.querySelector<HTMLButtonElement>("#confirm-pdf-insert-only");
+	const updateBtn = document.querySelector<HTMLButtonElement>("#confirm-pdf-update-only");
+	const pageLabel = document.querySelector<HTMLParagraphElement>("#pdf-preview-page");
+	const countLabel = document.querySelector<HTMLParagraphElement>("#pdf-preview-count");
+	const pageSelect = document.querySelector<HTMLInputElement>("#pdf-preview-select-page");
+	if (!modal || !source || !errors || !body || !autoCategorizeBtn || !importAllBtn || !insertBtn || !updateBtn || !pageLabel || !countLabel || !pageSelect) return;
+
+	if (pendingPdfRows.length === 0 && pendingPdfErrors.length === 0 && !pendingPdfSourceLabel) {
+		modal.hidden = true;
+		return;
+	}
+
+	modal.hidden = false;
+	source.textContent = pendingPdfSourceLabel ? `Source: ${pendingPdfSourceLabel}` : "";
+	errors.textContent = pendingPdfErrors.length > 0 ? `${pendingPdfErrors.length} avertissements: ${pendingPdfErrors.slice(0, 4).join(" | ")}` : "Aucun avertissement.";
+	const filtered = filteredPendingPdfRows();
+	const pageRows = currentPendingPageRows();
+	const maxPage = Math.max(1, Math.ceil(filtered.length / pendingPdfPageSize));
+	const selectedCount = pendingPdfRows.filter((row) => row.selected).length;
+	autoCategorizeBtn.disabled = pendingPdfRows.length === 0;
+	importAllBtn.disabled = selectedCount === 0;
+	insertBtn.disabled = selectedCount === 0;
+	updateBtn.disabled = selectedCount === 0;
+	countLabel.textContent = `${selectedCount} selectionnees sur ${filtered.length} visibles (${pendingPdfRows.length} total).`;
+	pageLabel.textContent = `Page ${pendingPdfPage}/${maxPage}`;
+	pageSelect.checked = pageRows.length > 0 && pageRows.every((row) => row.selected);
+
+	const categoryOptions = categoryOptionsHtml();
+	body.innerHTML = pageRows
+		.map(
+			(row) => `<tr>
+				<td><input type="checkbox" data-action="pending-pdf-toggle" data-preview-id="${row.previewId}" ${row.selected ? "checked" : ""} /></td>
+				<td>${row.tx.date}</td>
+				<td>${row.tx.description}</td>
+				<td class="${row.tx.amount < 0 ? "neg" : "pos"}">${formatMoney(row.tx.amount)}</td>
+				<td>
+					<select class="table-category-select" data-action="pending-pdf-category" data-preview-id="${row.previewId}">
+						${categoryOptions}
+					</select>
+				</td>
+				<td><button class="btn danger compact" type="button" data-action="pending-pdf-delete" data-preview-id="${row.previewId}">Retirer</button></td>
+			</tr>`,
+		)
+		.join("");
+
+	pageRows.forEach((row) => {
+		const select = body.querySelector<HTMLSelectElement>(`select[data-action="pending-pdf-category"][data-preview-id="${row.previewId}"]`);
+		if (select) {
+			select.value = row.tx.category;
+		}
+	});
+};
+
+const addCustomCategory = async (): Promise<void> => {
+	const categoryInput = document.querySelector<HTMLInputElement>("#category-name");
+	const feedback = document.querySelector<HTMLParagraphElement>("#import-feedback");
+	if (!categoryInput) return;
+
+	const rawName = categoryInput.value.trim();
+	if (!rawName) return;
+
+	const normalizedName = rawName.replace(/\s+/g, " ");
+	const existing = allCategories().some((category) => category.localeCompare(normalizedName, "fr-CA", {sensitivity: "base"}) === 0);
+	if (existing) {
+		if (feedback) {
+			feedback.textContent = `La categorie \"${normalizedName}\" existe deja.`;
+		}
+		return;
+	}
+
+	await db.categories.add({
+		name: normalizedName,
+		createdAt: new Date().toISOString(),
+	});
+	customCategories = await db.categories.toArray();
+	categoryInput.value = "";
+	syncCategoryControls();
+	renderRules();
+	renderTransactions();
+	renderPdfPreviewModal();
+
+	if (feedback) {
+		feedback.textContent = `Categorie ajoutee: ${normalizedName}`;
+	}
+};
+
+const closePdfPreviewModal = (): void => {
+	pendingPdfRows = [];
+	pendingPdfErrors = [];
+	pendingPdfSourceLabel = "";
+	pendingPdfSearch = "";
+	pendingPdfAmountFilter = "all";
+	pendingPdfPage = 1;
+	renderPdfPreviewModal();
+};
+
+const openPdfPreviewModal = (nextTransactions: Transaction[], nextErrors: string[], sourceLabel: string): void => {
+	pendingPdfRows = nextTransactions.map((tx, index) => ({
+		previewId: `${tx.fingerprint}-${index}`,
+		selected: true,
+		tx,
+	}));
+	pendingPdfErrors = nextErrors;
+	pendingPdfSourceLabel = sourceLabel;
+	pendingPdfSearch = "";
+	pendingPdfAmountFilter = "all";
+	pendingPdfPage = 1;
+	autoCategorizePendingPdfRows("all", false);
+};
+
+const importPdfWithBackend = async (file: File): Promise<void> => {
+	const feedback = document.querySelector<HTMLParagraphElement>("#import-feedback");
+	if (feedback) {
+		feedback.textContent = `Extraction PDF en cours: ${file.name}`;
+	}
+
+	try {
+		const formData = new FormData();
+		formData.append("pdf", file);
+
+		const response = await fetch(`${backendBaseUrl}/api/import/pdf-preview`, {
+			method: "POST",
+			body: formData,
+		});
+
+		const payload = (await response.json()) as PdfPreviewResponse | {error: string};
+		if (!response.ok || "error" in payload) {
+			throw new Error("error" in payload ? payload.error : "Erreur backend inconnue.");
+		}
+
+		const previewTransactions = payload.transactions.map((item) => {
+			const source = "wealthsimple" as const;
+			return categorizeTransaction(
+				{
+					date: item.date,
+					description: item.description,
+					amount: item.amount,
+					source,
+					category: item.category ?? "Non classe",
+					fingerprint: createFingerprint(item.date, item.description, item.amount, source),
+					createdAt: new Date().toISOString(),
+				},
+				rules,
+			);
+		});
+
+		if (previewTransactions.length === 0) {
+			if (feedback) {
+				feedback.textContent = `Aucune transaction detectee dans ${file.name}.`;
+			}
+			return;
+		}
+
+		openPdfPreviewModal(previewTransactions, payload.errors, payload.sourceLabel);
+		if (feedback) {
+			feedback.textContent = `Preview PDF prete: ${previewTransactions.length} transactions detectees.`;
+		}
+	} catch (error) {
+		if (feedback) {
+			const message = error instanceof Error ? error.message : "Erreur inconnue";
+			feedback.textContent = `Echec import PDF: ${message}`;
 		}
 	}
 };
@@ -606,6 +995,9 @@ const clearAllTransactions = async (): Promise<void> => {
 const bindEvents = (): void => {
 	const importBtn = document.querySelector<HTMLButtonElement>("#import-btn");
 	const csvInput = document.querySelector<HTMLInputElement>("#csv-input");
+	const pdfImportBtn = document.querySelector<HTMLButtonElement>("#pdf-import-btn");
+	const pdfInput = document.querySelector<HTMLInputElement>("#pdf-input");
+	const pdfDropZone = document.querySelector<HTMLDivElement>("#pdf-drop-zone");
 	const exportBtn = document.querySelector<HTMLButtonElement>("#export-btn");
 	const monthSelect = document.querySelector<HTMLInputElement>("#month-select");
 	const searchInput = document.querySelector<HTMLInputElement>("#search-input");
@@ -614,16 +1006,33 @@ const bindEvents = (): void => {
 	const pdfTextForm = document.querySelector<HTMLFormElement>("#pdf-text-form");
 	const pdfTextInput = document.querySelector<HTMLTextAreaElement>("#pdf-text-input");
 	const ruleForm = document.querySelector<HTMLFormElement>("#rule-form");
+	const categoryForm = document.querySelector<HTMLFormElement>("#category-form");
 	const applyRulesBtn = document.querySelector<HTMLButtonElement>("#apply-rules-btn");
 	const goalForm = document.querySelector<HTMLFormElement>("#goal-form");
 	const goalInput = document.querySelector<HTMLInputElement>("#goal-value");
 	const transactionsBody = document.querySelector<HTMLTableSectionElement>("#transactions-body");
 	const clearAllBtn = document.querySelector<HTMLButtonElement>("#clear-all-btn");
 	const clearCategoryDetailBtn = document.querySelector<HTMLButtonElement>("#clear-category-detail");
+	const pdfPreviewBody = document.querySelector<HTMLTableSectionElement>("#pdf-preview-body");
+	const autoCategorizePdfPreviewBtn = document.querySelector<HTMLButtonElement>("#auto-categorize-pdf-preview");
+	const confirmPdfImportAllBtn = document.querySelector<HTMLButtonElement>("#confirm-pdf-import-all");
+	const confirmPdfInsertOnlyBtn = document.querySelector<HTMLButtonElement>("#confirm-pdf-insert-only");
+	const confirmPdfUpdateOnlyBtn = document.querySelector<HTMLButtonElement>("#confirm-pdf-update-only");
+	const cancelPdfImportBtn = document.querySelector<HTMLButtonElement>("#cancel-pdf-import");
+	const closePdfPreviewBtn = document.querySelector<HTMLButtonElement>("#close-pdf-preview");
+	const pdfPreviewSearch = document.querySelector<HTMLInputElement>("#pdf-preview-search");
+	const pdfPreviewAmountFilter = document.querySelector<HTMLSelectElement>("#pdf-preview-amount-filter");
+	const pdfPreviewSelectPage = document.querySelector<HTMLInputElement>("#pdf-preview-select-page");
+	const pdfPreviewPrev = document.querySelector<HTMLButtonElement>("#pdf-preview-prev");
+	const pdfPreviewNext = document.querySelector<HTMLButtonElement>("#pdf-preview-next");
 	const feedback = document.querySelector<HTMLParagraphElement>("#import-feedback");
 
 	const setImportDragState = (isActive: boolean): void => {
 		importBtn?.classList.toggle("drag-active", isActive);
+	};
+
+	const setPdfDragState = (isActive: boolean): void => {
+		pdfDropZone?.classList.toggle("drag-active", isActive);
 	};
 
 	importBtn?.addEventListener("click", () => {
@@ -664,6 +1073,47 @@ const bindEvents = (): void => {
 			(event.target as HTMLInputElement).value = "";
 		} else if (feedback) {
 			feedback.textContent = "Selectionne un fichier CSV valide.";
+		}
+	});
+
+	pdfImportBtn?.addEventListener("click", () => {
+		pdfInput?.click();
+	});
+
+	pdfDropZone?.addEventListener("dragenter", (event) => {
+		event.preventDefault();
+		setPdfDragState(true);
+	});
+
+	pdfDropZone?.addEventListener("dragover", (event) => {
+		event.preventDefault();
+		setPdfDragState(true);
+	});
+
+	pdfDropZone?.addEventListener("dragleave", () => {
+		setPdfDragState(false);
+	});
+
+	pdfDropZone?.addEventListener("drop", async (event) => {
+		event.preventDefault();
+		setPdfDragState(false);
+		const file = pickPdfFile(event.dataTransfer?.files ?? null);
+		if (!file) {
+			if (feedback) {
+				feedback.textContent = "Depose un fichier PDF valide.";
+			}
+			return;
+		}
+		await importPdfWithBackend(file);
+	});
+
+	pdfInput?.addEventListener("change", async (event) => {
+		const file = pickPdfFile((event.target as HTMLInputElement).files ?? null);
+		if (file) {
+			await importPdfWithBackend(file);
+			(event.target as HTMLInputElement).value = "";
+		} else if (feedback) {
+			feedback.textContent = "Selectionne un fichier PDF valide.";
 		}
 	});
 
@@ -741,6 +1191,11 @@ const bindEvents = (): void => {
 		await addRule();
 	});
 
+	categoryForm?.addEventListener("submit", async (event) => {
+		event.preventDefault();
+		await addCustomCategory();
+	});
+
 	applyRulesBtn?.addEventListener("click", async () => {
 		await recategorizeMonth();
 	});
@@ -754,14 +1209,110 @@ const bindEvents = (): void => {
 			refresh();
 		}
 	});
+
+	pdfPreviewBody?.addEventListener("click", (event) => {
+		const target = event.target as HTMLElement;
+		const button = target.closest<HTMLButtonElement>('button[data-action="pending-pdf-delete"]');
+		if (!button) return;
+		const previewId = button.dataset.previewId;
+		if (!previewId) return;
+		pendingPdfRows = pendingPdfRows.filter((row) => row.previewId !== previewId);
+		renderPdfPreviewModal();
+	});
+
+	pdfPreviewBody?.addEventListener("change", (event) => {
+		const target = event.target as HTMLElement;
+		const select = target.closest<HTMLSelectElement>('select[data-action="pending-pdf-category"]');
+		if (select) {
+			const previewId = select.dataset.previewId;
+			if (!previewId) return;
+			const row = pendingPdfRows.find((item) => item.previewId === previewId);
+			if (!row) return;
+			row.tx.category = select.value;
+			return;
+		}
+
+		const toggle = target.closest<HTMLInputElement>('input[data-action="pending-pdf-toggle"]');
+		if (!toggle) return;
+		const previewId = toggle.dataset.previewId;
+		if (!previewId) return;
+		const row = pendingPdfRows.find((item) => item.previewId === previewId);
+		if (!row) return;
+		row.selected = toggle.checked;
+		renderPdfPreviewModal();
+	});
+
+	pdfPreviewSearch?.addEventListener("input", () => {
+		pendingPdfSearch = pdfPreviewSearch.value;
+		pendingPdfPage = 1;
+		renderPdfPreviewModal();
+	});
+
+	pdfPreviewAmountFilter?.addEventListener("change", () => {
+		pendingPdfAmountFilter = pdfPreviewAmountFilter.value;
+		pendingPdfPage = 1;
+		renderPdfPreviewModal();
+	});
+
+	pdfPreviewSelectPage?.addEventListener("change", () => {
+		const pageRows = currentPendingPageRows();
+		for (const row of pageRows) {
+			row.selected = pdfPreviewSelectPage.checked;
+		}
+		renderPdfPreviewModal();
+	});
+
+	pdfPreviewPrev?.addEventListener("click", () => {
+		if (pendingPdfPage > 1) {
+			pendingPdfPage -= 1;
+			renderPdfPreviewModal();
+		}
+	});
+
+	pdfPreviewNext?.addEventListener("click", () => {
+		const total = filteredPendingPdfRows().length;
+		const maxPage = Math.max(1, Math.ceil(total / pendingPdfPageSize));
+		if (pendingPdfPage < maxPage) {
+			pendingPdfPage += 1;
+			renderPdfPreviewModal();
+		}
+	});
+
+	autoCategorizePdfPreviewBtn?.addEventListener("click", () => {
+		autoCategorizePendingPdfRows("selected");
+	});
+
+	const closeModal = () => {
+		closePdfPreviewModal();
+	};
+
+	closePdfPreviewBtn?.addEventListener("click", closeModal);
+	cancelPdfImportBtn?.addEventListener("click", closeModal);
+	confirmPdfImportAllBtn?.addEventListener("click", async () => {
+		const selected = pendingPdfRows.filter((row) => row.selected).map((row) => row.tx);
+		await persistImportedTransactions(selected, pendingPdfErrors, `PDF ${pendingPdfSourceLabel}`, "all");
+		closePdfPreviewModal();
+	});
+	confirmPdfInsertOnlyBtn?.addEventListener("click", async () => {
+		const selected = pendingPdfRows.filter((row) => row.selected).map((row) => row.tx);
+		await persistImportedTransactions(selected, pendingPdfErrors, `PDF ${pendingPdfSourceLabel}`, "insert-only");
+		closePdfPreviewModal();
+	});
+	confirmPdfUpdateOnlyBtn?.addEventListener("click", async () => {
+		const selected = pendingPdfRows.filter((row) => row.selected).map((row) => row.tx);
+		await persistImportedTransactions(selected, pendingPdfErrors, `PDF ${pendingPdfSourceLabel}`, "update-only");
+		closePdfPreviewModal();
+	});
 };
 
 const bootstrap = async (): Promise<void> => {
-	renderLayout();
 	transactions = await db.transactions.toArray();
 	rules = await db.rules.toArray();
 	goals = await db.goals.toArray();
+	customCategories = await db.categories.toArray();
+	renderLayout();
 	bindEvents();
+	syncCategoryControls();
 	refresh();
 };
 
