@@ -1,0 +1,19 @@
+# Ignore everything
+*
+
+# Whitelist root level files
+!.gitignore
+!package.json
+!package-lock.json
+!tsconfig.json
+!index.html
+
+# Whitelist directories
+!public/
+!scripts/
+!src/
+
+# Allow everything inside whitelisted directories
+!public/**
+!scripts/**
+!src/**
