@@ -7,7 +7,7 @@
 !package-lock.json
 !tsconfig.json
 !index.html
-README.md
+!README.md
 
 # Whitelist directories
 !public/
