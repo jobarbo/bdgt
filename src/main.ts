@@ -680,20 +680,12 @@ const pickPdfFile = (fileList: FileList | null): File | null => {
 const filteredPendingPdfRows = (): PendingPdfRow[] => {
 	const query = pendingPdfSearch.trim().toLowerCase();
 	return pendingPdfRows.filter((row) => {
-		const matchesAmount =
-			pendingPdfAmountFilter === "all" ||
-			(pendingPdfAmountFilter === "negative" && row.tx.amount < 0) ||
-			(pendingPdfAmountFilter === "positive" && row.tx.amount > 0);
+		const matchesAmount = pendingPdfAmountFilter === "all" || (pendingPdfAmountFilter === "negative" && row.tx.amount < 0) || (pendingPdfAmountFilter === "positive" && row.tx.amount > 0);
 		if (!matchesAmount) return false;
 
 		if (!query) return true;
 		const amountText = String(row.tx.amount);
-		return (
-			row.tx.date.toLowerCase().includes(query) ||
-			row.tx.description.toLowerCase().includes(query) ||
-			row.tx.category.toLowerCase().includes(query) ||
-			amountText.includes(query)
-		);
+		return row.tx.date.toLowerCase().includes(query) || row.tx.description.toLowerCase().includes(query) || row.tx.category.toLowerCase().includes(query) || amountText.includes(query);
 	});
 };
 

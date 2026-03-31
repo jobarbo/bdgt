@@ -230,7 +230,10 @@ textarea {
 	gap: 0.9rem;
 	justify-items: start;
 	background: rgba(255, 248, 238, 0.7);
-	transition: border-color 0.18s ease, background 0.18s ease, transform 0.18s ease;
+	transition:
+		border-color 0.18s ease,
+		background 0.18s ease,
+		transform 0.18s ease;
 }
 
 .pdf-drop-zone.drag-active {

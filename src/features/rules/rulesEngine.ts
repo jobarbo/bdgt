@@ -43,14 +43,7 @@ export const inferCategoryFromDescription = (description: string, amount: number
 	) {
 		return "Resto";
 	}
-	if (
-		d.includes("supermarche") ||
-		d.includes("super c") ||
-		d.includes("maxi") ||
-		d.includes("iga") ||
-		d.includes("marche") ||
-		d.includes("alimentex")
-	) {
+	if (d.includes("supermarche") || d.includes("super c") || d.includes("maxi") || d.includes("iga") || d.includes("marche") || d.includes("alimentex")) {
 		return "Epicerie";
 	}
 	if (d.includes("passe temps")) return "Loisirs";
@@ -76,11 +69,7 @@ export const applyRulesToTransaction = (transaction: Transaction, rules: Categor
 	return transaction;
 };
 
-export const categorizeTransaction = (
-	transaction: Transaction,
-	rules: CategoryRule[],
-	options?: {preserveExistingCategory?: boolean},
-): Transaction => {
+export const categorizeTransaction = (transaction: Transaction, rules: CategoryRule[], options?: {preserveExistingCategory?: boolean}): Transaction => {
 	const hasExplicitCategory = transaction.category.trim().length > 0 && transaction.category !== "Non classe";
 	if (options?.preserveExistingCategory && hasExplicitCategory) {
 		return transaction;
