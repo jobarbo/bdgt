@@ -312,19 +312,20 @@ const renderRules = (): void => {
 	const customList = document.querySelector<HTMLUListElement>("#custom-categories-list");
 	if (!customList) return;
 	const categories = sortCategories(customCategories.map((category) => category.name));
-	customList.innerHTML = categories.length > 0
-		? categories
-				.map(
-					(category) => `<li>
+	customList.innerHTML =
+		categories.length > 0
+			? categories
+					.map(
+						(category) => `<li>
 						<span>${category}</span>
 						<span class="split-actions">
 							<button class="btn alt compact" type="button" data-action="edit-category" data-category-name="${category}">Modifier</button>
 							<button class="btn danger compact" type="button" data-action="delete-category" data-category-name="${category}">Supprimer</button>
 						</span>
 					</li>`,
-				)
-				.join("")
-		: '<li class="muted">Aucune categorie personnalisee.</li>';
+					)
+					.join("")
+			: '<li class="muted">Aucune categorie personnalisee.</li>';
 };
 
 const syncCategorySelect = (select: HTMLSelectElement, optionsHtml: string, fallback: string): void => {
